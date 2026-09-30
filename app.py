@@ -8,12 +8,13 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from ofxparse import OfxParser
+import pdfplumber
+import pandas as pd
 
 # Configuração da página do Streamlit
 st.set_page_config(
-    page_title="Conversor e Categorizador Extrato OFX",
-    page_icon="📊",
+    page_title="Conversor de Extrato PDF para OFX & Categorizador",
+    page_icon="📄",
     layout="wide"
 )
 
@@ -80,7 +81,7 @@ DEFAULT_KEYWORDS = {
 }
 
 # ==========================================
-# 3. SERVIÇOS DE CATEGORIZAÇÃO E LOG
+# 3. SERVIÇOS DE CATEGORIZAÇÃO E PARSER PDF
 # ==========================================
 
 class SimpleLogger:
@@ -109,6 +110,75 @@ class SmartKeywordCategorizer:
 
     def get_available_categories(self) -> List[str]:
         return list(self.keywords.keys()) + ["Outros"]
+
+class PDFStatementParser:
+    """
+    Extrai transações de extratos bancários em PDF baseando-se em padrões comuns de linhas 
+    (Data, Descrição e Valor monetário).
+    """
+    @staticmethod
+    def parse_pdf(file_path: Path) -> List[Transaction]:
+        transactions = []
+        current_year = datetime.now().year
+        
+        # Regex flexível para capturar: Data (DD/MM ou DD/MM/AAAA), Descrição e Valor (ex: 1.234,56 ou -150,00)
+        # Exemplo de linha: 15/08/2026 PIX TRANSF JOAO SILVA -150,00 ou 15/08 SUPERMERCADO 45,90
+        line_pattern = re.compile(
+            r'^(\d{2}/\d{2}(?:/\d{4})?)\s+(.*?)\s+(-?\d{1,3}(?:\.\d{3})*,\d{2})\s*$',
+            re.UNICODE
+        )
+        
+        # Padrão alternativo caso o valor venha sem ponto de milhar
+        line_pattern_alt = re.compile(
+            r'^(\d{2}/\d{2}(?:/\d{4})?)\s+(.*?)\s+(-?\d+,\d{2})\s*$',
+            re.UNICODE
+        )
+
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if not text:
+                    continue
+                
+                lines = text.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    match = line_pattern.match(line) or line_pattern_alt.match(line)
+                    
+                    if match:
+                        date_raw, desc_raw, amount_raw = match.groups()
+                        
+                        # Processamento da Data
+                        try:
+                            if len(date_raw.split('/')) == 2:
+                                date_str_full = f"{date_raw}/{current_year}"
+                                dt_obj = datetime.strptime(date_str_full, '%d/%m/%Y')
+                            else:
+                                dt_obj = datetime.strptime(date_raw, '%d/%m/%Y')
+                            formatted_date = dt_obj.strftime('%Y%m%d')
+                        except ValueError:
+                            formatted_date = datetime.now().strftime('%Y%m%d')
+
+                        # Processamento do Valor
+                        try:
+                            clean_amount = amount_raw.replace('.', '').replace(',', '.')
+                            amount = float(clean_amount)
+                        except ValueError:
+                            amount = 0.0
+
+                        description = desc_raw.strip()
+                        trntype = 'CREDIT' if amount > 0 else 'DEBIT'
+                        
+                        transactions.append(Transaction(
+                            date=formatted_date,
+                            amount=amount,
+                            description=description,
+                            transaction_type="entrada" if amount > 0 else "saída",
+                            trntype=trntype,
+                            fitid=f"pdf_{abs(hash(f'{formatted_date}_{description}_{amount}'))}"
+                        ))
+                        
+        return transactions
 
 # ==========================================
 # 4. PROCESSADORES E ESCRITORES OFX
@@ -145,7 +215,7 @@ NEWFILEUID:NONE
 <SEVERITY>INFO
 </STATUS>
 <STMTRS>
-<CURDEF>BRL>
+<CURDEF>BRL</CURDEF>
 <BANKACCTFROM>
 <BANKID>{account_data.bank_id}</BANKID>
 <ACCTID>{account_data.account}</ACCTID>
@@ -181,70 +251,69 @@ NEWFILEUID:NONE
 # ==========================================
 
 def main():
-    st.title("📊 Processador e Categorizador de Extratos OFX")
-    st.markdown("Faça o upload dos seus arquivos **.OFX**, categorize transações automaticamente e extraia relatórios consolidados.")
+    st.title("📄 Conversor de Extrato PDF para OFX & Categorizador")
+    st.markdown("Faça o upload dos seus extratos em **PDF**, extraia as transações automaticamente, categorize-as e gere o arquivo **OFX** compatível com sistemas contábeis e financeiros.")
 
     # Inicialização de diretórios locais temporários
+    Path("pdf_uploads").mkdir(exist_ok=True)
     Path("ofxs_gerados").mkdir(exist_ok=True)
     Path("csv_reports").mkdir(exist_ok=True)
 
     logger = SimpleLogger()
     categorizer = SmartKeywordCategorizer(DEFAULT_KEYWORDS)
 
-    # Sidebar para controles
-    st.sidebar.header("Painel de Controle")
-    uploaded_files = st.file_uploader("Selecione arquivos OFX para processar", type=["ofx"], accept_multiple_files=True)
+    # Sidebar para controles e Dados da Conta para o OFX
+    st.sidebar.header("⚙️ Configurações da Conta")
+    bank_id = st.sidebar.text_input("Código do Banco (Ex: 001, 341)", "001")
+    agency = st.sidebar.text_input("Agência", "1234")
+    account = st.sidebar.text_input("Conta Corrente", "56789-0")
+
+    st.sidebar.markdown("---")
+    uploaded_files = st.file_uploader("Selecione arquivos PDF de extratos para processar", type=["pdf"], accept_multiple_files=True)
 
     if uploaded_files:
-        st.success(f"{len(uploaded_files)} arquivo(s) carregado(s) com sucesso!")
+        st.success(f"{len(uploaded_files)} arquivo(s) PDF carregado(s) com sucesso!")
         
-        if st.button("🚀 Processar e Categorizar Extratos"):
+        if st.button("🚀 Extrair, Categorizar e Gerar OFX"):
             all_transactions = []
             
             for uploaded_file in uploaded_files:
-                file_path = Path("ofxs_gerados") / uploaded_file.name
+                file_path = Path("pdf_uploads") / uploaded_file.name
                 with open(file_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
                 
-                # Processamento do OFX usando ofxparse
                 try:
-                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                        ofx = OfxParser()
-                        parsed_ofx = ofx.parse(f)
+                    # Extração do PDF via PDFStatementParser
+                    extracted_txs = PDFStatementParser.parse_pdf(file_path)
+                    
+                    for t in extracted_txs:
+                        category = categorizer.categorize_transaction(t.description, t.amount)
+                        t.category = category
+                        all_transactions.append(t)
                         
-                    for account in parsed_ofx.accounts:
-                        if hasattr(account, 'statement') and account.statement:
-                            for t in account.statement.transactions:
-                                date_str = t.date.strftime('%Y%m%d') if t.date else datetime.now().strftime('%Y%m%d')
-                                amount = float(t.amount) if t.amount else 0.0
-                                desc = t.memo or t.type or 'Sem descrição'
-                                trntype = t.type or ('CREDIT' if amount > 0 else 'DEBIT')
-                                
-                                category = categorizer.categorize_transaction(desc, amount)
-                                
-                                all_transactions.append(Transaction(
-                                    date=date_str,
-                                    amount=amount,
-                                    description=desc,
-                                    transaction_type="entrada" if amount > 0 else "saída",
-                                    trntype=trntype,
-                                    category=category,
-                                    fitid=t.id if hasattr(t, 'id') and t.id else f"t_{abs(hash(desc))}"
-                                ))
                 except Exception as e:
-                    st.error(f"Erro ao processar o arquivo {uploaded_file.name}: {e}")
+                    st.error(f"Erro ao processar o PDF {uploaded_file.name}: {e}")
 
             if all_transactions:
                 st.session_state['transactions'] = all_transactions
-                st.success("Processamento concluído com sucesso!")
+                st.session_state['account_data'] = AccountData(
+                    bank_name="Banco",
+                    agency=agency,
+                    account=account,
+                    bank_id=bank_id,
+                    org="",
+                    fid=""
+                )
+                st.success(f"Processamento concluído! {len(all_transactions)} transações extraídas com sucesso.")
+            else:
+                st.warning("Nenhuma transação pôde ser identificada automaticamente com o padrão atual do PDF. Verifique se o formato do texto do extrato é compatível.")
 
     # Exibição de Dados e Relatórios se existirem transações processadas
     if 'transactions' in st.session_state:
         transactions: List[Transaction] = st.session_state['transactions']
         
-        st.subheader("📋 Resumo das Transações Processadas")
+        st.subheader("📋 Resumo das Transações Extraídas")
         
-        # Converter para formato tabular para exibição
         data_rows = []
         for tx in transactions:
             data_rows.append({
@@ -255,7 +324,6 @@ def main():
                 "Categoria": tx.category
             })
             
-        import pandas as pd
         df = pd.DataFrame(data_rows)
         
         # Filtro por Categoria na interface
@@ -276,7 +344,20 @@ def main():
         col2.metric("Entradas Totais", f"R$ {total_receitas:,.2f}")
         col3.metric("Saídas Totais", f"R$ {total_despesas:,.2f}")
 
-        # Opção de exportação para CSV (incluindo transações "Outros")
+        # Geração do Arquivo OFX para Download
+        st.subheader("💾 Geração de Arquivo OFX")
+        writer = OFXWriterRefactored()
+        account_data = st.session_state['account_data']
+        ofx_string = writer.write(transactions, account_data)
+        
+        st.download_button(
+            label="Baixar Arquivo OFX Convertido",
+            data=ofx_string,
+            file_name="extrato_convertido.ofx",
+            mime="application/x-ofx"
+        )
+
+        # Opção de exportação para CSV
         st.subheader("📥 Exportação de Relatórios")
         csv_data = df.to_csv(index=False).encode('utf-8')
         st.download_button(
